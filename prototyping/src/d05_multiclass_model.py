@@ -10,6 +10,7 @@ import numpy as np
 from torchvision.datasets import ImageFolder, DatasetFolder
 import torch
 from torch import nn
+from numpy.typing import NDArray
 
 # from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.optim.lr_scheduler import OneCycleLR
@@ -17,12 +18,14 @@ from torch.utils.data import Subset, SubsetRandomSampler, DataLoader, random_spl
 import torchvision.transforms.v2 as transforms
 import mlflow
 from mlflow.models.signature import infer_signature
+from torchtune.datasets import ConcatDataset
 
 # import random
 from ignite.engine import create_supervised_trainer
 from ignite.handlers import FastaiLRFinder
 from scipy.ndimage import gaussian_filter1d
 from torch.optim import Optimizer
+from sklearn.utils.class_weight import compute_class_weight
 
 logging.getLogger("mlflow.utils.requirements_utils").setLevel(logging.ERROR)
 logging.getLogger("mlflow.store.model_registry.abstract_store").setLevel(logging.ERROR)
@@ -38,24 +41,32 @@ class NN(nn.Module):
         torch.manual_seed(42)
         
         self.layers = squeezenet1_1(weights="SqueezeNet1_1_Weights.IMAGENET1K_V1")
-        """
         self.layers.classifier =  nn.Sequential(nn.Dropout(p=0.5, inplace=False),
-                                                nn.Conv2d(512, 256, kernel_size=(2, 2), stride=(1, 1)),
+                                                nn.Conv2d(512, 7, kernel_size=(1, 1), stride=(1, 1)),
                                                 nn.ReLU(inplace=True),
-                                                nn.Dropout(p=0.5, inplace=False),
+                                                nn.AdaptiveAvgPool2d(output_size=(1, 1))
+                                                )
+        self.layers.classifier =  nn.Sequential(nn.Dropout(p=0.5, inplace=False),
+                                                nn.Conv2d(512, 256, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2)),
+                                                nn.ReLU(inplace=True),
                                                 nn.Conv2d(256, 7, kernel_size=(1, 1), stride=(1, 1)),
                                                 nn.ReLU(inplace=True),
-                                                nn.AdaptiveAvgPool2d(output_size=(1, 1)),
-                                                
-                                                #nn.Softmax(1)
+                                                nn.AdaptiveAvgPool2d(output_size=(1, 1))
                                                 )
-        """
+        self.layers.classifier =  nn.Sequential(nn.Dropout(p=0.5, inplace=False),
+                                                nn.Conv2d(512, 256, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2)),
+                                                nn.ReLU(inplace=True),
+                                                nn.Conv2d(256, 128, kernel_size=(3, 3), stride=(1, 1), padding=(2, 2)),
+                                                nn.ReLU(inplace=True),
+                                                nn.Conv2d(128, 7, kernel_size=(1, 1), stride=(1, 1)),
+                                                nn.ReLU(inplace=True),
+                                                nn.AdaptiveAvgPool2d(output_size=(1, 1))
+                                                )
         self.layers.classifier =  nn.Sequential(nn.Dropout(p=0.5, inplace=False),
                                                 nn.Conv2d(512, 7, kernel_size=(1, 1), stride=(1, 1)),
                                                 nn.ReLU(inplace=True),
                                                 nn.AdaptiveAvgPool2d(output_size=(1, 1)),
-                                                
-                                                #nn.Softmax(1)
+                                                nn.Linear(1,1)
                                                 )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -131,15 +142,14 @@ class Trainer:
                 for X, y in dataloader:
                     X = X.to(self.device)
                     y = y.to(self.device).float()
-                    pred = model(X)#.view(-1)
-                    y_tmp = torch.zeros(pred.size()).to('cuda')
-                    
+                    pred = model(X)#.view(-1)  
+
+                    y_tmp = torch.zeros(pred.size()).to('cuda')                    
                     for i in range(y.size()[0]):
                         y_tmp[i, int(y[i])] = 1
-                    y=y_tmp                    
+                    y=y_tmp          
 
-                    loss += self.loss_fn(pred, y).item()
-                    
+                    loss += self.loss_fn(pred, y).item()                    
                     pred = nn.functional.softmax(pred, 1)
 
                     for i in range(len(pred)):
@@ -156,8 +166,7 @@ class Trainer:
                         
                         if conf_err_flg:
                             conf_errors += 1
-
-        return loss / total_samples, int(errors), conf_errors
+        return loss / total_samples, int(errors), int(conf_errors)
 
     def _tracking_start(
         self,
@@ -201,9 +210,9 @@ class Trainer:
     def _test_and_log(
         self, loaders: dict, model: NN, e: int
     ) -> int:
-        test_loss, test_errors, conf_test_errors  = self._test(loaders["test"], model)
+        test_loss, test_errors, conf_test_errors = self._test(loaders["test"], model)
         train_loss, train_errors, conf_train_errors = self._test(loaders["train"], model)
-        #assembly_loss, assembly_errors = self._test([loaders["assembly"],], model)
+        assembly_loss, assembly_errors, conf_assembly_errors = self._test([loaders["assembly"],], model)
 
         if self.tracking:
             mlflow.log_metrics(
@@ -214,8 +223,9 @@ class Trainer:
                     "test_errors": test_errors,
                     "conf_train_errors": conf_train_errors,
                     "conf_test_errors": conf_test_errors,
-                    #"assembly_loss": assembly_loss,
-                    #"assembly_errors": assembly_errors
+                    "assembly_loss": assembly_loss,
+                    "assembly_errors": assembly_errors,                    
+                    "conf_assembly_errors": conf_assembly_errors
                 },
                 step=e,
                 synchronous=False,
@@ -232,7 +242,7 @@ class Trainer:
         folder: str,
         part: str,
         num_in_assembly: int,
-        epochs: int = 300,
+        epochs: int = 100,
         weight_decay: float = 1e-7,
         model: NN | None = None
     ) -> NN:
@@ -247,7 +257,8 @@ class Trainer:
         else:
             print('Training existing model')
 
-        loaders = self.get_dataloaders(f"{folder}/{part}", img_shape, num_in_assembly, part)
+        loaders, weights = self.get_dataloaders(f"{folder}/{part}", img_shape, num_in_assembly, part)
+        self.loss_fn = nn.CrossEntropyLoss(reduction='sum', weight=torch.tensor(weights).to('cuda'))
         optimizer = torch.optim.Adadelta(model.parameters(), weight_decay=weight_decay)
 
         # lr = self.find_lr(model, optimizer, loaders['lr'], loss_fn)
@@ -280,19 +291,43 @@ class Trainer:
             torch.cuda.empty_cache()
 
         return model
-
+    
     # @staticmethod
-    def get_dataloaders(self, folder: str, img_shape: tuple, num_in_assembly: int, part:str) -> dict:
+    def get_dataloaders(self, folder: str, img_shape: tuple, num_in_assembly: int, part:str) -> tuple[dict, NDArray]:
         normalize_arg = [0.5] * img_shape[0]
         img_transforms = [transforms.ToImage(),
                             transforms.ToDtype(torch.float32, scale=True),
                             transforms.Normalize(normalize_arg, normalize_arg)]
+        
+        img_transforms =             [
+                transforms.ToImage(),
+                transforms.ToDtype(torch.float32, scale=True),
+                transforms.ColorJitter(brightness=(0.8, 1.2)),
+                transforms.Normalize(normalize_arg, normalize_arg),
+                
+                #transforms.RandomCrop(size=(img_shape[1]*2, img_shape[2]*2), padding=(img_shape[2], img_shape[1]), padding_mode='edge')
+            ]
+        
+        if img_shape[0] == 1:
+            img_transforms = [transforms.Grayscale(num_output_channels=1),] + img_transforms
+        
+        img_transforms += [transforms.RandomRotation(degrees=25, interpolation=transforms.InterpolationMode.BILINEAR),  # type: ignore
+                transforms.RandomPerspective(distortion_scale=0.2)]
+        """
         if img_shape[0] == 1:
             img_transforms = [transforms.Grayscale(num_output_channels=1),] + img_transforms
 
+        """
+        
+
         img_transforms = transforms.Compose(img_transforms)
         
-        ds = ImageFolder(root=f"{folder}/{part}", transform=img_transforms)                
+        ds = ImageFolder(root=f"{folder}", transform=img_transforms)    
+
+        idx_to_class  = {v: int(k) for k, v in ds.class_to_idx.items()}
+
+        for i in range(len(ds)):
+            ds.samples[i] = (ds.samples[i][0], idx_to_class[ds.samples[i][1]])
 
         folders = str.split(folder, "/")     
         ds_src = ImageFolder(root=f"./data/temp/{folders[-3]}/{folders[-2]}", transform=img_transforms)
@@ -316,44 +351,55 @@ class Trainer:
 
         batch_size = 16#self.get_batch_size(img_shape, ds_lst[proper_ds_idx])
 
-        train_loaders = []
-        test_loaders = []
-
         generator = torch.Generator().manual_seed(42)
+        #splits_ds = random_split(ds, [0.8, 0.2], generator)
+        from sklearn.model_selection import train_test_split
+        train_idx, test_idx = train_test_split(
+                                        list(range(len(ds))),
+                                        test_size=0.2,
+                                        stratify=ds.targets,
+                                        random_state=42
+                                    )
+        splits_ds = Subset(ds, train_idx), Subset(ds, test_idx)
 
-        for ds in ds_lst:
-            splits = random_split(ds, [0.8, 0.2], generator)
+        splits_src = random_split(ds_src_train, [0.8, 0.2], generator)
+        splits_ass = random_split(ds_assembly, [0.2, 0.8], generator)
 
-            train_loader = DataLoader(
-                splits[0],
-                batch_size=batch_size,
-                num_workers=4,
-                pin_memory=True,
-                drop_last=True,  # for aspects with small amounts of samples
-                shuffle=True
-            )
-            train_loaders.append(train_loader)
+        train_ds = ConcatDataset([splits_ds[0], splits_src[0], splits_ass[0]])
+        test_ds = ConcatDataset([splits_ds[1], splits_src[1]])
 
-            test_loader = DataLoader(
-                splits[1], batch_size=batch_size, num_workers=4, pin_memory=True
-            )
-            test_loaders.append(test_loader)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,  # for aspects with small amounts of samples
+            shuffle=True
+        )
 
-        splits = random_split(ds_assembly, [0.2, 0.8], generator)
-        loader_assembly_train = DataLoader(splits[0], batch_size=batch_size, num_workers=4, pin_memory=True)
-        train_loaders.append(loader_assembly_train)
-        loader_assembly_test = DataLoader(splits[1], batch_size=batch_size, num_workers=4, pin_memory=True)
-        test_loaders.append(loader_assembly_test)
-        loader_assembly = None#DataLoader(ds_assembly, batch_size=batch_size, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(
+            test_ds, batch_size=batch_size, num_workers=4, pin_memory=True
+        )
+        loader_assembly = DataLoader(splits_ass[1], batch_size=batch_size, num_workers=4, pin_memory=True)
+
+        classes = np.array(range(num_in_assembly + 2))
+        train_targets = []
+        for _, targets in train_loader:
+            train_targets.append(targets)
+        train_targets = torch.cat(train_targets).numpy()
         
-        return {"train": train_loaders, "test": test_loaders, "assembly": loader_assembly}
+        weights = compute_class_weight(
+                                    class_weight="balanced",
+                                    classes=classes,
+                                    y=train_targets)
+        
+        return {"train": [train_loader,], "test": [test_loader,], "assembly": loader_assembly}, weights
 
     @staticmethod
     def get_img_shape(img_folder: str) -> tuple[int, int, int]:
-        aspect = os.listdir(img_folder)[0]
-        img_name = os.listdir(f"{img_folder}/{aspect}/h/1")[0]
+        img_name = os.listdir(f"{img_folder}/1")[0]
 
-        with open(f"{img_folder}/{aspect}/h/1/{img_name}", "rb") as f:
+        with open(f"{img_folder}/1/{img_name}", "rb") as f:
             img = Image.open(f)
             img.load()
 
@@ -361,7 +407,7 @@ class Trainer:
 
             if img.mode in ("1", "L"):
                 channels = 1
-
+        
         return channels, img.height, img.width
 
     def get_batch_size(self, img_shape: tuple, ds: ImageFolder) -> int:
