@@ -163,9 +163,7 @@ class NN(nn.Module):
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(1000, 500),
-            nn.ReLU(inplace=True),
-            nn.Linear(500, 1),
+            nn.Linear(1000, 1),
             # nn.AdaptiveAvgPool2d(output_size=(1, 1)),
             # nn.Flatten(),
             # nn.Linear(1000, 500),
@@ -175,12 +173,12 @@ class NN(nn.Module):
             # nn.Conv2d(1000, 1, kernel_size=(1, 1), stride=(1, 1)),
             # nn.AdaptiveAvgPool2d((1, 1))
         )
-
+        
         self.layers = efficientnet_b0(weights="EfficientNet_B0_Weights.IMAGENET1K_V1")
         self.layers.classifier = nn.Sequential(
             nn.Dropout(p=0.2, inplace=True), nn.Linear(1280, 1)
         )
-
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.layers(x)
         return res
@@ -270,10 +268,12 @@ class Trainer:
                 pred = model(X).view(-1)
 
                 loss += self.loss_fn(pred, y).item()
-                errors += torch.sum(torch.round(pred) != y).item()
+                #print(pred)
+                #print(y)
+                #print(torch.isclose(pred, y))
+                errors += torch.sum(~pred.isclose(y, atol=0.5/6)).item()
                 conf_errors += torch.sum(
-                    (torch.round(pred) != y)
-                    | ((torch.frac(pred) > 0.25) & (torch.frac(pred) < 0.75))
+                    0.25/6 < torch.abs(pred - y)###!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                 ).item()
 
         return loss / total_samples, int(errors), int(conf_errors)
@@ -320,32 +320,33 @@ class Trainer:
         train_loss, train_errors, conf_train_errors = self._test(
             loaders["train"], model
         )
+        """
         assembly_loss, assembly_errors, conf_assembly_errors = self._test(
             loaders["assembly"], model
         )
-
+        """
         if self.tracking:
             mlflow.log_metrics(
                 {
                     "train_loss": train_loss,
                     "test_loss": test_loss,
-                    "assembly_loss": assembly_loss,
+                    #"assembly_loss": assembly_loss,
                     "train_errors": train_errors,
                     "test_errors": test_errors,
-                    "assembly_errors": assembly_errors,
+                    #"assembly_errors": assembly_errors,
                     "conf_train_errors": conf_train_errors,
                     "conf_test_errors": conf_test_errors,
-                    "conf_assembly_errors": conf_assembly_errors,
+                    #"conf_assembly_errors": conf_assembly_errors,
                 },
                 step=e,
                 synchronous=False,
             )
         else:
             print(
-                f"{datetime.datetime.now()}\t{e}\tErrors: {train_errors}-{test_errors}-{assembly_errors}\tLoss: {train_loss:.6f}-{test_loss:.6f}-{assembly_loss:.6f}"
+                f"{datetime.datetime.now()}\t{e}\tErrors: {train_errors}-{test_errors}\tConf Errors: {conf_train_errors}-{conf_test_errors}\tLoss: {train_loss:.6f}-{test_loss:.6f}"
             )
 
-        return test_errors + train_errors
+        return conf_test_errors + conf_train_errors
 
     def train_model(
         self,
@@ -372,7 +373,7 @@ class Trainer:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        loaders, weights = self.get_dataloaders(
+        loaders = self.get_dataloaders(
             f"{folder}/{part}", img_shape, num_in_assembly, part
         )
         optimizer = torch.optim.Adadelta(model.parameters(), weight_decay=weight_decay)
@@ -411,7 +412,8 @@ class Trainer:
     # @staticmethod
     def get_dataloaders(
         self, folder: str, img_shape: tuple, num_in_assembly: int, part: str
-    ) -> tuple[dict, NDArray]:
+    ) -> dict:
+        # transforms
         normalize_arg = [0.5] * img_shape[0]
         train_transforms = [
             transforms.ToImage(),
@@ -436,67 +438,107 @@ class Trainer:
             #transforms.extend([????????????????
 
         train_transforms += [
-            transforms.RandomRotation(degrees=25, interpolation=transforms.InterpolationMode.BILINEAR),  # type: ignore
+            #transforms.RandomRotation(degrees=25, interpolation=transforms.InterpolationMode.BILINEAR),  # type: ignore
             transforms.RandomPerspective(distortion_scale=0.2),
         ]
 
         train_transforms = transforms.Compose(train_transforms)
         test_transforms = transforms.Compose(test_transforms)
-
-        ds = ImageFolder(root=f"{folder}", transform=img_transforms)
-
-        idx_to_class = {v: int(k) for k, v in ds.class_to_idx.items()}
-
-        for i in range(len(ds)):
-            ds.samples[i] = (ds.samples[i][0], idx_to_class[ds.samples[i][1]])
+        # datasets
+        ds_synth_train = ImageFolder(root=f"{folder}", transform=train_transforms)
+        ds_synth_test = ImageFolder(root=f"{folder}", transform=test_transforms)
+        
+        idx_to_class = {v: int(k) for k, v in ds_synth_train.class_to_idx.items()}
+        
+        for i in range(len(ds_synth_train)):
+            ds_synth_train.targets[i] = idx_to_class[ds_synth_train.samples[i][1]]
+            ds_synth_train.samples[i] = (ds_synth_train.samples[i][0], idx_to_class[ds_synth_train.samples[i][1]])
+            ds_synth_test.targets[i] = idx_to_class[ds_synth_test.samples[i][1]]
+            ds_synth_test.samples[i] = (ds_synth_test.samples[i][0], idx_to_class[ds_synth_test.samples[i][1]])
 
         folders = str.split(folder, "/")
-        ds_src = ImageFolder(
-            root=f"./data/temp/{folders[-3]}/{folders[-2]}", transform=img_transforms
-        )
+        src_folder = f"./data/temp/{folders[-3]}/{folders[-2]}"
+        ds_src_train = ImageFolder(root=src_folder, transform=train_transforms)
+        ds_src_test = ImageFolder(root=src_folder, transform=test_transforms)
 
-        assembly_class_idx = ds_src.class_to_idx["assembly"]
-        assembly_indices = [
-            i for i, (_, y) in enumerate(ds_src.samples) if y == assembly_class_idx
-        ]
-        part_class_idx = ds_src.class_to_idx[part]
-        src_train_indices = [
-            i
-            for i, (_, y) in enumerate(ds_src.samples)
-            if y not in [assembly_class_idx, part_class_idx]
-        ]
+        idx_to_class = {v: k  for k, v in ds_src_train.class_to_idx.items()}
+        
+        for i in range(len(ds_src_train)):
+            if idx_to_class[ds_src_train.samples[i][1]] == "assembly":
+                val = num_in_assembly
+            elif idx_to_class[ds_src_train.samples[i][1]] == part:
+                val = 1
+            else:
+                val = 0
 
-        for i in assembly_indices:
-            ds_src.targets[i] = num_in_assembly
-            path, _ = ds_src.samples[i]
-            ds_src.samples[i] = (path, num_in_assembly)
-        ds_assembly = Subset(ds_src, assembly_indices)
+            ds_src_train.targets[i] = val
+            ds_src_train.samples[i] = (ds_src_train.samples[i][0], val)
+            ds_src_test.targets[i] = val
+            ds_src_test.samples[i] = (ds_src_train.samples[i][0], val)
+        # indices from datasets
+        train_imgs_per_class = len(ds_synth_train) // (num_in_assembly + 1)
+        train_imgs_per_class = int(0.8 * train_imgs_per_class)
+        print("imgs_per_class", train_imgs_per_class)
+        targets_synth_train = np.array(ds_synth_train.targets)
+        targets_src_train = np.array(ds_src_train.targets)
+        
+        zero_indices_src = np.where(targets_src_train == 0)[0]
+        chosen_zero_src  = np.random.choice(zero_indices_src, size=train_imgs_per_class, replace=False)
 
-        for i in src_train_indices:
-            ds_src.targets[i] = 0
-            path, _ = ds_src.samples[i]
-            ds_src.samples[i] = (path, 0)
-        ds_src_train = Subset(ds_src, src_train_indices)
+        class5_src_indices = np.where(targets_src_train == num_in_assembly)[0]
+        max_src5_allowed = min(train_imgs_per_class // 2, int(0.2 * len(class5_src_indices)))
+        chosen_src5 = np.random.choice(class5_src_indices, size=max_src5_allowed, replace=False)
 
-        batch_size = 16  # self.get_batch_size(img_shape, ds_lst[proper_ds_idx])
+        remaining_needed = train_imgs_per_class - max_src5_allowed
+        class5_synth_indices = np.where(targets_synth_train == num_in_assembly)[0]
+        chosen_synth5 = np.random.choice(class5_synth_indices, size=remaining_needed, replace=False)
 
-        generator = torch.Generator().manual_seed(42)
-        # splits_ds = random_split(ds, [0.8, 0.2], generator)
-        from sklearn.model_selection import train_test_split
+        non5_indices_synth = np.where(targets_synth_train != num_in_assembly)[0]
+        num_non5 = int(0.8 * len(non5_indices_synth))
+        #chosen_non5_synth = np.random.choice(non5_indices_synth, size=num_non5, replace=False)
+        #chosen_non5_synth = np.array([], dtype=int)
+        synth_targets = set(ds_synth_train.targets)
+        synth_targets.remove(num_in_assembly)
+        
+        for target in synth_targets:
+            chosen_synth5 = np.concatenate([chosen_synth5,
+                                               np.random.choice(np.where(targets_synth_train == target)[0], size=train_imgs_per_class, replace=False)])
+            
+        #scale target
+        for i in range(len(ds_src_train)):
+            ds_src_train.targets[i] = float(ds_src_train.targets[i] / (num_in_assembly + 1))
+            ds_src_train.samples[i] = (ds_src_train.samples[i][0], float(ds_src_train.samples[i][1] / (num_in_assembly + 1)))
+            ds_src_test.targets[i] = float(ds_src_test.targets[i] / (num_in_assembly + 1))
+            ds_src_test.samples[i] = (ds_src_train.samples[i][0], float(ds_src_train.samples[i][1] / (num_in_assembly + 1)))
+        for i in range(len(ds_synth_train)):
+            ds_synth_train.targets[i] = float(ds_synth_train.targets[i] / (num_in_assembly + 1))
+            ds_synth_train.samples[i] = (ds_synth_train.samples[i][0], float(ds_synth_train.samples[i][1] / (num_in_assembly + 1)))
+            ds_synth_test.targets[i] = float(ds_synth_test.targets[i] / (num_in_assembly + 1))
+            ds_synth_test.samples[i] = (ds_synth_test.samples[i][0], float(ds_synth_test.samples[i][1] / (num_in_assembly + 1)))
+        
+        # Collect chosen indices
+        train_indices_src = np.concatenate([chosen_zero_src, chosen_src5])
+        #train_indices_synth = np.concatenate([chosen_non5_synth, chosen_synth5])
+        train_indices_synth = chosen_synth5
 
-        train_idx, test_idx = train_test_split(
-            list(range(len(ds))), test_size=0.2, stratify=ds.targets, random_state=42
-        )
-        splits_ds = Subset(ds, train_idx), Subset(ds, test_idx)
+        train_ds_src   = Subset(ds_src_train, train_indices_src)
+        train_ds_synth = Subset(ds_synth_train, train_indices_synth)
 
-        splits_src = random_split(ds_src_train, [0.8, 0.2], generator)
-        splits_ass = random_split(ds_assembly, [0.2, 0.8], generator)
+        train_ds_full = ConcatDataset([train_ds_src, train_ds_synth])
 
-        train_ds = ConcatDataset([splits_ds[0], splits_src[0], splits_ass[0]])
-        test_ds = ConcatDataset([splits_ds[1], splits_src[1]])
+        remaining_src_indices = np.setdiff1d(np.arange(len(ds_src_train)), train_indices_src)
+        test_src_train_part = Subset(ds_src_train, remaining_src_indices)
+
+        # For synth_train:
+        remaining_synth_indices = np.setdiff1d(np.arange(len(ds_synth_train)), train_indices_synth)
+        test_synth_train_part = Subset(ds_synth_train, remaining_synth_indices)
+
+        # Also include dedicated test sets:
+        test_ds = ConcatDataset([test_src_train_part, test_synth_train_part])
+        batch_size = 16#self.get_batch_size(img_shape, ds_lst[proper_ds_idx])
 
         train_loader = DataLoader(
-            train_ds,
+            train_ds_full,
             batch_size=batch_size,
             num_workers=4,
             pin_memory=True,
@@ -507,25 +549,11 @@ class Trainer:
         test_loader = DataLoader(
             test_ds, batch_size=batch_size, num_workers=4, pin_memory=True
         )
-        loader_assembly = DataLoader(
-            splits_ass[1], batch_size=batch_size, num_workers=4, pin_memory=True
-        )
-
-        classes = np.array(range(num_in_assembly + 2))
-        train_targets = []
-        for _, targets in train_loader:
-            train_targets.append(targets)
-        train_targets = torch.cat(train_targets).numpy()
-
-        weights = compute_class_weight(
-            class_weight="balanced", classes=classes, y=train_targets
-        )
 
         return {
             "train": train_loader,
-            "test": test_loader,
-            "assembly": loader_assembly,
-        }, weights
+            "test": test_loader
+        }
 
     @staticmethod
     def get_img_shape(img_folder: str) -> tuple[int, int, int]:
